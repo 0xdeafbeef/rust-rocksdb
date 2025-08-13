@@ -37,6 +37,7 @@ bindgen-static = ["librocksdb-sys/bindgen-static"]
 lto = ["librocksdb-sys/lto"]
 
 [dependencies]
+chrono = "0.4.41"
 libc = "0.2"
 librocksdb-sys = { path = "librocksdb-sys", version = "0.17.3", default-features = false, features = [
     "static",

@@ -33,6 +33,8 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::iter;
 use std::path::Path;
 use std::path::PathBuf;
@@ -41,7 +43,41 @@ use std::slice;
 use std::str;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::Mutex;
 use std::time::Duration;
+
+fn get_cf_name(cf: &impl AsColumnFamilyRef) -> String {
+    unsafe {
+        let mut name_len: size_t = 0;
+        let name_ptr = ffi::rocksdb_column_family_handle_get_name(
+            cf.inner(),
+            &mut name_len as *mut size_t,
+        );
+        if name_ptr.is_null() {
+            return "unknown".to_string();
+        }
+        let name_slice = slice::from_raw_parts(name_ptr as *const u8, name_len);
+        String::from_utf8_lossy(name_slice).into_owned()
+    }
+}
+
+macro_rules! log_write_op {
+    ($self:expr, $op:expr) => {
+        if let Ok(mut log) = $self.write_log.lock() {
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            let thread_id = std::thread::current().id();
+            let _ = writeln!(&mut *log, "{},{},default,{:?}", timestamp, $op, thread_id);
+        }
+    };
+    ($self:expr, $op:expr, $cf:expr) => {
+        if let Ok(mut log) = $self.write_log.lock() {
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            let thread_id = std::thread::current().id();
+            let cf_name = get_cf_name($cf);
+            let _ = writeln!(&mut *log, "{},{},{},{:?}", timestamp, $op, cf_name, thread_id);
+        }
+    };
+}
 
 /// A range of keys, `start_key` is included, but not `end_key`.
 ///
@@ -145,6 +181,7 @@ pub struct DBCommon<T: ThreadMode, D: DBInner> {
     pub(crate) inner: D,
     cfs: T, // Column families are held differently depending on thread mode
     path: PathBuf,
+    write_log: Arc<Mutex<BufWriter<File>>>,
     _outlive: Vec<OptionsMustOutliveDB>,
 }
 
@@ -707,10 +744,22 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
             return Err(Error::new("Could not initialize database.".to_owned()));
         }
 
+        // Create per-database log file
+        let db_path = path.as_ref().to_path_buf();
+        let db_name = db_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        let log_path = format!("/tmp/{}_writes.csv", db_name);
+        let mut file = File::create(&log_path).unwrap();
+        writeln!(&mut file, "timestamp,operation,cf_name,thread_id").unwrap();
+        let write_log = Arc::new(Mutex::new(BufWriter::new(file)));
+
         Ok(Self {
             inner: DBWithThreadModeInner { inner: db },
-            path: path.as_ref().to_path_buf(),
+            path: db_path,
             cfs: T::new_cf_map_internal(cf_map),
+            write_log,
             _outlive: outlive,
         })
     }
@@ -837,6 +886,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
                 to.as_ptr() as *const c_char,
                 to.len() as size_t,
             ));
+            log_write_op!(self, "delete_range_cf", cf);
             Ok(())
         }
     }
@@ -859,6 +909,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
                 batch.inner
             ));
         }
+        log_write_op!(self, "write_batch");
         Ok(())
     }
 
@@ -876,10 +927,21 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
 /// Common methods of `DBWithThreadMode` and `OptimisticTransactionDB`.
 impl<T: ThreadMode, D: DBInner> DBCommon<T, D> {
     pub(crate) fn new(inner: D, cfs: T, path: PathBuf, outlive: Vec<OptionsMustOutliveDB>) -> Self {
+        // Create per-database log file
+        let db_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        let log_path = format!("/tmp/{}_writes.csv", db_name);
+        let mut file = File::create(&log_path).unwrap();
+        writeln!(&mut file, "timestamp,operation,cf_name,thread_id").unwrap();
+        let write_log = Arc::new(Mutex::new(BufWriter::new(file)));
+        
         Self {
             inner,
             cfs,
             path,
+            write_log,
             _outlive: outlive,
         }
     }
@@ -1554,6 +1616,9 @@ impl<T: ThreadMode, D: DBInner> DBCommon<T, D> {
                 value.as_ptr() as *const c_char,
                 value.len() as size_t,
             ));
+            
+            log_write_op!(self, "put");
+            
             Ok(())
         }
     }
@@ -1582,6 +1647,7 @@ impl<T: ThreadMode, D: DBInner> DBCommon<T, D> {
                 value.as_ptr() as *const c_char,
                 value.len() as size_t,
             ));
+            log_write_op!(self, "put_cf", cf);
             Ok(())
         }
     }
@@ -1618,6 +1684,7 @@ impl<T: ThreadMode, D: DBInner> DBCommon<T, D> {
                 value.as_ptr() as *const c_char,
                 value.len() as size_t,
             ));
+            log_write_op!(self, "put_with_ts");
             Ok(())
         }
     }
@@ -1656,6 +1723,7 @@ impl<T: ThreadMode, D: DBInner> DBCommon<T, D> {
                 value.as_ptr() as *const c_char,
                 value.len() as size_t,
             ));
+            log_write_op!(self, "put_cf_with_ts", cf);
             Ok(())
         }
     }
@@ -1677,6 +1745,7 @@ impl<T: ThreadMode, D: DBInner> DBCommon<T, D> {
                 value.as_ptr() as *const c_char,
                 value.len() as size_t,
             ));
+            log_write_op!(self, "merge");
             Ok(())
         }
     }
@@ -1705,6 +1774,7 @@ impl<T: ThreadMode, D: DBInner> DBCommon<T, D> {
                 value.as_ptr() as *const c_char,
                 value.len() as size_t,
             ));
+            log_write_op!(self, "merge_cf", cf);
             Ok(())
         }
     }
@@ -1723,6 +1793,7 @@ impl<T: ThreadMode, D: DBInner> DBCommon<T, D> {
                 key.as_ptr() as *const c_char,
                 key.len() as size_t,
             ));
+            log_write_op!(self, "delete");
             Ok(())
         }
     }
@@ -1743,6 +1814,7 @@ impl<T: ThreadMode, D: DBInner> DBCommon<T, D> {
                 key.as_ptr() as *const c_char,
                 key.len() as size_t,
             ));
+            log_write_op!(self, "delete_cf", cf);
             Ok(())
         }
     }
@@ -1771,6 +1843,7 @@ impl<T: ThreadMode, D: DBInner> DBCommon<T, D> {
                 ts.as_ptr() as *const c_char,
                 ts.len() as size_t,
             ));
+            log_write_op!(self, "delete_with_ts");
             Ok(())
         }
     }
@@ -1801,6 +1874,7 @@ impl<T: ThreadMode, D: DBInner> DBCommon<T, D> {
                 ts.as_ptr() as *const c_char,
                 ts.len() as size_t,
             ));
+            log_write_op!(self, "delete_cf_with_ts", cf);
             Ok(())
         }
     }
